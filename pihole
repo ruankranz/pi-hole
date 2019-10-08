@@ -13,26 +13,16 @@ readonly PI_HOLE_SCRIPT_DIR="/opt/pihole"
 readonly gravitylist="/etc/pihole/gravity.list"
 readonly blacklist="/etc/pihole/black.list"
 
-# setupVars is not readonly here because in some funcitons (checkout),
+# setupVars and PI_HOLE_BIN_DIR are not readonly here because in some funcitons (checkout),
 # it might get set again when the installer is sourced. This causes an
 # error due to modifying a readonly variable.
 setupVars="/etc/pihole/setupVars.conf"
+PI_HOLE_BIN_DIR="/usr/local/bin"
 
 readonly colfile="${PI_HOLE_SCRIPT_DIR}/COL_TABLE"
 source "${colfile}"
 
 resolver="pihole-FTL"
-
-# Must be root to use this tool
-if [[ ! $EUID -eq 0 ]];then
-  if [[ -x "$(command -v sudo)" ]]; then
-    exec sudo bash "$0" "$@"
-    exit $?
-  else
-    echo -e "  ${CROSS} sudo is needed to run pihole commands.  Please run this script as root or install sudo."
-    exit 1
-  fi
-fi
 
 webpageFunc() {
   source "${PI_HOLE_SCRIPT_DIR}/webpage.sh"
@@ -109,20 +99,16 @@ versionFunc() {
 
 restartDNS() {
   local svcOption svc str output status
-  svcOption="${1:-}"
+  svcOption="${1:-restart}"
 
-  # Determine if we should reload or restart restart
+  # Determine if we should reload or restart
   if [[ "${svcOption}" =~ "reload" ]]; then
-    # Using SIGHUP will NOT re-read any *.conf files
+    # Reload has been requested
+    # Note: This will NOT re-read any *.conf files
     svc="killall -s SIGHUP ${resolver}"
   else
-    # Get PID of resolver to determine if it needs to start or restart
-    if pidof pihole-FTL &> /dev/null; then
-      svcOption="restart"
-    else
-      svcOption="start"
-    fi
-    svc="service ${resolver} ${svcOption}"
+    # A full restart has been requested
+    svc="service ${resolver} restart"
   fi
 
   # Print output to Terminal, but not to Web Admin
@@ -155,6 +141,10 @@ Time:
 
   elif [[ "${1}" == "0" ]]; then
     # Disable Pi-hole
+    if grep -cq "BLOCKING_ENABLED=false" "${setupVars}"; then
+      echo -e "  ${INFO} Blocking already disabled, nothing to do"
+      exit 0
+    fi
     if [[ -e "${gravitylist}" ]]; then
       mv "${gravitylist}" "${gravitylist}.bck"
       echo "" > "${gravitylist}"
@@ -171,7 +161,7 @@ Time:
           local str="Disabling blocking for ${tt} seconds"
           echo -e "  ${INFO} ${str}..."
           local str="Blocking will be re-enabled in ${tt} seconds"
-          nohup bash -c "sleep ${tt}; pihole enable" </dev/null &>/dev/null &
+          nohup bash -c "sleep ${tt}; ${PI_HOLE_BIN_DIR}/pihole enable" </dev/null &>/dev/null &
         else
           local error=true
         fi
@@ -182,7 +172,7 @@ Time:
           echo -e "  ${INFO} ${str}..."
           local str="Blocking will be re-enabled in ${tt} minutes"
           tt=$((${tt}*60))
-          nohup bash -c "sleep ${tt}; pihole enable" </dev/null &>/dev/null &
+          nohup bash -c "sleep ${tt}; ${PI_HOLE_BIN_DIR}/pihole enable" </dev/null &>/dev/null &
         else
           local error=true
         fi
@@ -204,6 +194,10 @@ Time:
     fi
   else
     # Enable Pi-hole
+    if grep -cq "BLOCKING_ENABLED=true" "${setupVars}"; then
+      echo -e "  ${INFO} Blocking already enabled, nothing to do"
+      exit 0
+    fi
     echo -e "  ${INFO} Enabling blocking"
     local str="Pi-hole Enabled"
 
@@ -240,7 +234,7 @@ Options:
     sed -i 's/^QUERY_LOGGING=true/QUERY_LOGGING=false/' /etc/pihole/setupVars.conf
     if [[ "${2}" != "noflush" ]]; then
       # Flush logs
-      pihole -f
+      "${PI_HOLE_BIN_DIR}"/pihole -f
     fi
     echo -e "  ${INFO} Disabling logging..."
     local str="Logging has been disabled!"
@@ -293,7 +287,7 @@ statusFunc() {
       *) echo -e "  ${INFO} Pi-hole blocking will be enabled";;
     esac
     # Enable blocking
-    pihole enable
+    "${PI_HOLE_BIN_DIR}"/pihole enable
   fi
 }
 
@@ -428,6 +422,21 @@ Options:
 
 if [[ $# = 0 ]]; then
   helpFunc
+fi
+
+case "${1}" in
+  "-h" | "help" | "--help"      ) helpFunc;;
+esac
+
+# Must be root to use this tool
+if [[ ! $EUID -eq 0 ]];then
+  if [[ -x "$(command -v sudo)" ]]; then
+    exec sudo bash "$0" "$@"
+    exit $?
+  else
+    echo -e "  ${CROSS} sudo is needed to run pihole commands.  Please run this script as root or install sudo."
+    exit 1
+  fi
 fi
 
 # Handle redirecting to specific functions based on arguments

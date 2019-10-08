@@ -13,7 +13,14 @@ FTLUSER=pihole
 PIDFILE=/var/run/pihole-FTL.pid
 
 get_pid() {
-    pidof "pihole-FTL"
+    # First, try to obtain PID from PIDFILE
+    if [ -s "${PIDFILE}" ]; then
+        cat "${PIDFILE}"
+        return
+    fi
+
+    # If the PIDFILE is empty or not available, obtain the PID using pidof
+    pidof "pihole-FTL" | awk '{print $(NF)}'
 }
 
 is_running() {
@@ -33,6 +40,8 @@ start() {
     mkdir -p /var/run/pihole
     mkdir -p /var/log/pihole
     chown pihole:pihole /var/run/pihole /var/log/pihole
+    # Remove possible leftovers from previous pihole-FTL processes
+    rm -f /dev/shm/FTL-* 2> /dev/null
     rm /var/run/pihole/FTL.sock 2> /dev/null
     # Ensure that permissions are set so that pihole-FTL can edit all necessary files
     chown pihole:pihole /run/pihole-FTL.pid /run/pihole-FTL.port

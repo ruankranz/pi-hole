@@ -28,6 +28,20 @@ set -e
 # Local variables will be in lowercase and will exist only within functions
 # It's still a work in progress, so you may see some variance in this guideline until it is complete
 
+# List of supported DNS servers
+DNS_SERVERS=$(cat << EOM
+Google (ECS);8.8.8.8;8.8.4.4;2001:4860:4860:0:0:0:0:8888;2001:4860:4860:0:0:0:0:8844
+OpenDNS (ECS);208.67.222.222;208.67.220.220;2620:119:35::35;2620:119:53::53
+Level3;4.2.2.1;4.2.2.2;;
+Comodo;8.26.56.26;8.20.247.20;;
+DNS.WATCH;84.200.69.80;84.200.70.40;2001:1608:10:25:0:0:1c04:b12f;2001:1608:10:25:0:0:9249:d69b
+Quad9 (filtered, DNSSEC);9.9.9.9;149.112.112.112;2620:fe::fe;2620:fe::9
+Quad9 (unfiltered, no DNSSEC);9.9.9.10;149.112.112.10;2620:fe::10;2620:fe::fe:10
+Quad9 (filtered + ECS);9.9.9.11;149.112.112.11;2620:fe::11;
+Cloudflare;1.1.1.1;1.0.0.1;2606:4700:4700::1111;2606:4700:4700::1001
+EOM
+)
+
 # Location for final installation log storage
 installLogLoc=/etc/pihole/install.log
 # This is an important file as it contains information specific to the machine it's being installed on
@@ -38,9 +52,12 @@ lighttpdConfig=/etc/lighttpd/lighttpd.conf
 # This is a file used for the colorized output
 coltable=/opt/pihole/COL_TABLE
 
+# Root of the web server
+webroot="/var/www/html"
+
 # We store several other directories and
 webInterfaceGitUrl="https://github.com/pi-hole/AdminLTE.git"
-webInterfaceDir="/var/www/html/admin"
+webInterfaceDir="${webroot}/admin"
 piholeGitUrl="https://github.com/pi-hole/pi-hole.git"
 PI_HOLE_LOCAL_REPO="/etc/.pihole"
 # These are the names of pi-holes files, stored in an array
@@ -48,6 +65,8 @@ PI_HOLE_FILES=(chronometer list piholeDebug piholeLogFlush setupLCD update versi
 # This directory is where the Pi-hole scripts will be installed
 PI_HOLE_INSTALL_DIR="/opt/pihole"
 PI_HOLE_CONFIG_DIR="/etc/pihole"
+PI_HOLE_BIN_DIR="/usr/local/bin"
+PI_HOLE_BLOCKPAGE_DIR="${webroot}/pihole"
 useUpdateVars=false
 
 adlistFile="/etc/pihole/adlists.list"
@@ -66,8 +85,13 @@ if [ -z "${USER}" ]; then
 fi
 
 
-# Find the rows and columns will default to 80x24 if it can not be detected
-screen_size=$(stty size || printf '%d %d' 24 80)
+# Check if we are running on a real terminal and find the rows and columns
+# If there is no real terminal, we will default to 80x24
+if [ -t 0 ] ; then
+  screen_size=$(stty size)
+else
+  screen_size="24 80"
+fi
 # Set rows variable to contain first number
 printf -v rows '%d' "${screen_size%% *}"
 # Set columns variable to contain second number
@@ -114,6 +138,9 @@ else
     DONE="${COL_LIGHT_GREEN} done!${COL_NC}"
     OVER="\\r\\033[K"
 fi
+
+# Define global binary variable
+binary="tbd"
 
 # A simple function that just echoes out our logo in ASCII format
 # This lets users know that it is a Pi-hole, LLC product
@@ -165,6 +192,20 @@ if is_command apt-get ; then
     # grep -c will return 1 retVal on 0 matches, block this throwing the set -e with an OR TRUE
     PKG_COUNT="${PKG_MANAGER} -s -o Debug::NoLocking=true upgrade | grep -c ^Inst || true"
     # Some distros vary slightly so these fixes for dependencies may apply
+    # on Ubuntu 18.04.1 LTS we need to add the universe repository to gain access to dialog and dhcpcd5
+    APT_SOURCES="/etc/apt/sources.list"
+    if awk 'BEGIN{a=1;b=0}/bionic main/{a=0}/bionic.*universe/{b=1}END{exit a + b}' ${APT_SOURCES}; then
+        if ! whiptail --defaultno --title "Dependencies Require Update to Allowed Repositories" --yesno "Would you like to enable 'universe' repository?\\n\\nThis repository is required by the following packages:\\n\\n- dhcpcd5\\n- dialog" ${r} ${c}; then
+            printf "  %b Aborting installation: dependencies could not be installed.\\n" "${CROSS}"
+            exit # exit the installer
+        else
+            printf "  %b Enabling universe package repository for Ubuntu Bionic\\n" "${INFO}"
+            cp ${APT_SOURCES} ${APT_SOURCES}.backup # Backup current repo list
+            printf "  %b Backed up current configuration to %s\\n" "${TICK}" "${APT_SOURCES}.backup"
+            add-apt-repository universe
+            printf "  %b Enabled %s\\n" "${TICK}" "'universe' repository"
+        fi
+    fi
     # Debian 7 doesn't have iproute2 so if the dry run install is successful,
     if ${PKG_MANAGER} install --dry-run iproute2 > /dev/null 2>&1; then
         # we can install it
@@ -207,7 +248,7 @@ if is_command apt-get ; then
     # These programs are stored in an array so they can be looped through later
     INSTALLER_DEPS=(apt-utils dialog debconf dhcpcd5 git ${iproute_pkg} whiptail)
     # Pi-hole itself has several dependencies that also need to be installed
-    PIHOLE_DEPS=(bc cron curl dnsutils iputils-ping lsof netcat psmisc sudo unzip wget idn2 sqlite3 libcap2-bin dns-root-data resolvconf)
+    PIHOLE_DEPS=(cron curl dnsutils iputils-ping lsof netcat psmisc sudo unzip wget idn2 sqlite3 libcap2-bin dns-root-data resolvconf libcap2)
     # The Web dashboard has some that also need to be installed
     # It's useful to separate the two since our repos are also setup as "Core" code and "Web" code
     PIHOLE_WEB_DEPS=(lighttpd ${phpVer}-common ${phpVer}-cgi ${phpVer}-${phpSqlite})
@@ -248,8 +289,8 @@ elif is_command rpm ; then
     UPDATE_PKG_CACHE=":"
     PKG_INSTALL=(${PKG_MANAGER} install -y)
     PKG_COUNT="${PKG_MANAGER} check-update | egrep '(.i686|.x86|.noarch|.arm|.src)' | wc -l"
-    INSTALLER_DEPS=(dialog git iproute newt procps-ng which)
-    PIHOLE_DEPS=(bc bind-utils cronie curl findutils nmap-ncat sudo unzip wget libidn2 psmisc sqlite)
+    INSTALLER_DEPS=(dialog git iproute newt procps-ng which chkconfig)
+    PIHOLE_DEPS=(bind-utils cronie curl findutils nmap-ncat sudo unzip wget libidn2 psmisc sqlite libcap)
     PIHOLE_WEB_DEPS=(lighttpd lighttpd-fastcgi php-common php-cli php-pdo)
     LIGHTTPD_USER="lighttpd"
     LIGHTTPD_GROUP="lighttpd"
@@ -378,7 +419,7 @@ make_repo() {
         rm -rf "${directory}"
     fi
     # Clone the repo and return the return code from this command
-    git clone -q --depth 1 "${remoteRepo}" "${directory}" &> /dev/null || return $?
+    git clone -q --depth 20 "${remoteRepo}" "${directory}" &> /dev/null || return $?
     # Show a colored message showing it's status
     printf "%b  %b %s\\n" "${OVER}" "${TICK}" "${str}"
     # Always return 0? Not sure this is correct
@@ -490,7 +531,7 @@ find_IPv4_information() {
     fi
 
     # Append the CIDR notation to the IP address, if valid_ip fails this should return 127.0.0.1/8
-    IPV4_ADDRESS=$(ip -oneline -family inet address show | grep "${IPv4bare}" |  awk '{print $4}' | awk 'END {print}')
+    IPV4_ADDRESS=$(ip -oneline -family inet address show | grep "${IPv4bare}/" |  awk '{print $4}' | awk 'END {print}')
 }
 
 # Get available interfaces that are UP
@@ -842,6 +883,13 @@ setStaticIPv4() {
     # Local, named variables
     local IFCFG_FILE
     local CONNECTION_NAME
+
+    # If a static interface is already configured, we are done.
+    if [[ -r "/etc/sysconfig/network/ifcfg-${PIHOLE_INTERFACE}" ]]; then
+        if grep -q '^BOOTPROTO=.static.' "/etc/sysconfig/network/ifcfg-${PIHOLE_INTERFACE}"; then
+            return 0
+        fi
+    fi
     # For the Debian family, if dhcpcd.conf exists,
     if [[ -f "/etc/dhcpcd.conf" ]]; then
         # configure networking via dhcpcd
@@ -902,15 +950,26 @@ setDNS() {
     local DNSSettingsCorrect
 
     # In an array, list the available upstream providers
-    DNSChooseOptions=(Google ""
-        OpenDNS ""
-        Level3 ""
-        Comodo ""
-        DNSWatch ""
-        Quad9 ""
-        FamilyShield ""
-        Cloudflare ""
-        Custom "")
+    DNSChooseOptions=()
+    local DNSServerCount=0
+    # Save the old Internal Field Separator in a variable
+    OIFS=$IFS
+    # and set the new one to newline
+    IFS=$'\n'
+    # Put the DNS Servers into an array
+    for DNSServer in ${DNS_SERVERS}
+    do
+        DNSName="$(cut -d';' -f1 <<< "${DNSServer}")"
+        DNSChooseOptions[DNSServerCount]="${DNSName}"
+        (( DNSServerCount=DNSServerCount+1 ))
+        DNSChooseOptions[DNSServerCount]=""
+        (( DNSServerCount=DNSServerCount+1 ))
+    done
+    DNSChooseOptions[DNSServerCount]="Custom"
+    (( DNSServerCount=DNSServerCount+1 ))
+    DNSChooseOptions[DNSServerCount]=""
+    # Restore the IFS to what it was
+    IFS=${OIFS}
     # In a whiptail dialog, show the options
     DNSchoices=$(whiptail --separate-output --menu "Select Upstream DNS Provider. To use your own, select Custom." ${r} ${c} 7 \
     "${DNSChooseOptions[@]}" 2>&1 >/dev/tty) || \
@@ -920,113 +979,90 @@ setDNS() {
     # Display the selection
     printf "  %b Using " "${INFO}"
     # Depending on the user's choice, set the GLOBAl variables to the IP of the respective provider
-    case ${DNSchoices} in
-        Google)
-            printf "Google DNS servers\\n"
-            PIHOLE_DNS_1="8.8.8.8"
-            PIHOLE_DNS_2="8.8.4.4"
-            ;;
-        OpenDNS)
-            printf "OpenDNS servers\\n"
-            PIHOLE_DNS_1="208.67.222.222"
-            PIHOLE_DNS_2="208.67.220.220"
-            ;;
-        Level3)
-            printf "Level3 servers\\n"
-            PIHOLE_DNS_1="4.2.2.1"
-            PIHOLE_DNS_2="4.2.2.2"
-            ;;
-        Comodo)
-            printf "Comodo Secure servers\\n"
-            PIHOLE_DNS_1="8.26.56.26"
-            PIHOLE_DNS_2="8.20.247.20"
-            ;;
-        DNSWatch)
-            printf "DNS.WATCH servers\\n"
-            PIHOLE_DNS_1="84.200.69.80"
-            PIHOLE_DNS_2="84.200.70.40"
-            ;;
-        Quad9)
-            printf "Quad9 servers\\n"
-            PIHOLE_DNS_1="9.9.9.9"
-            PIHOLE_DNS_2="149.112.112.112"
-            ;;
-        FamilyShield)
-            printf "FamilyShield servers\\n"
-            PIHOLE_DNS_1="208.67.222.123"
-            PIHOLE_DNS_2="208.67.220.123"
-            ;;
-        Cloudflare)
-            printf "Cloudflare servers\\n"
-            PIHOLE_DNS_1="1.1.1.1"
-            PIHOLE_DNS_2="1.0.0.1"
-            ;;
-        Custom)
-            # Until the DNS settings are selected,
-            until [[ "${DNSSettingsCorrect}" = True ]]; do
-                #
-                strInvalid="Invalid"
-                # If the first
-                if [[ ! "${PIHOLE_DNS_1}" ]]; then
-                    # and second upstream servers do not exist
-                    if [[ ! "${PIHOLE_DNS_2}" ]]; then
-                        prePopulate=""
-                    # Otherwise,
-                    else
-                        prePopulate=", ${PIHOLE_DNS_2}"
-                    fi
-                elif  [[ "${PIHOLE_DNS_1}" ]] && [[ ! "${PIHOLE_DNS_2}" ]]; then
-                    prePopulate="${PIHOLE_DNS_1}"
-                elif [[ "${PIHOLE_DNS_1}" ]] && [[ "${PIHOLE_DNS_2}" ]]; then
-                    prePopulate="${PIHOLE_DNS_1}, ${PIHOLE_DNS_2}"
-                fi
-
-                # Dialog for the user to enter custom upstream servers
-                piholeDNS=$(whiptail --backtitle "Specify Upstream DNS Provider(s)"  --inputbox "Enter your desired upstream DNS provider(s), separated by a comma.\\n\\nFor example '8.8.8.8, 8.8.4.4'" ${r} ${c} "${prePopulate}" 3>&1 1>&2 2>&3) || \
-                { printf "  %bCancel was selected, exiting installer%b\\n" "${COL_LIGHT_RED}" "${COL_NC}"; exit 1; }
-                # Clean user input and replace whitespace with comma.
-                piholeDNS=$(sed 's/[, \t]\+/,/g' <<< "${piholeDNS}")
-
-                printf -v PIHOLE_DNS_1 "%s" "${piholeDNS%%,*}"
-                printf -v PIHOLE_DNS_2 "%s" "${piholeDNS##*,}"
-
-                # If the IP is valid,
-                if ! valid_ip "${PIHOLE_DNS_1}" || [[ ! "${PIHOLE_DNS_1}" ]]; then
-                    # store it in the variable so we can use it
-                    PIHOLE_DNS_1=${strInvalid}
-                fi
-                # Do the same for the secondary server
-                if ! valid_ip "${PIHOLE_DNS_2}" && [[ "${PIHOLE_DNS_2}" ]]; then
-                    PIHOLE_DNS_2=${strInvalid}
-                fi
-                # If either of the DNS servers are invalid,
-                if [[ "${PIHOLE_DNS_1}" == "${strInvalid}" ]] || [[ "${PIHOLE_DNS_2}" == "${strInvalid}" ]]; then
-                    # explain this to the user
-                    whiptail --msgbox --backtitle "Invalid IP" --title "Invalid IP" "One or both entered IP addresses were invalid. Please try again.\\n\\n    DNS Server 1:   $PIHOLE_DNS_1\\n    DNS Server 2:   ${PIHOLE_DNS_2}" ${r} ${c}
-                    # and set the variables back to nothing
-                    if [[ "${PIHOLE_DNS_1}" == "${strInvalid}" ]]; then
-                        PIHOLE_DNS_1=""
-                    fi
-                    if [[ "${PIHOLE_DNS_2}" == "${strInvalid}" ]]; then
-                        PIHOLE_DNS_2=""
-                    fi
-                # Since the settings will not work, stay in the loop
-                DNSSettingsCorrect=False
+    if [[ "${DNSchoices}" == "Custom" ]]
+    then
+        # Until the DNS settings are selected,
+        until [[ "${DNSSettingsCorrect}" = True ]]; do
+            #
+            strInvalid="Invalid"
+            # If the first
+            if [[ ! "${PIHOLE_DNS_1}" ]]; then
+                # and second upstream servers do not exist
+                if [[ ! "${PIHOLE_DNS_2}" ]]; then
+                    prePopulate=""
                 # Otherwise,
                 else
-                    # Show the settings
-                    if (whiptail --backtitle "Specify Upstream DNS Provider(s)" --title "Upstream DNS Provider(s)" --yesno "Are these settings correct?\\n    DNS Server 1:   $PIHOLE_DNS_1\\n    DNS Server 2:   ${PIHOLE_DNS_2}" ${r} ${c}); then
-                    # and break from the loop since the servers are valid
-                    DNSSettingsCorrect=True
-                    # Otherwise,
-                    else
-                        # If the settings are wrong, the loop continues
-                        DNSSettingsCorrect=False
-                    fi
+                    prePopulate=", ${PIHOLE_DNS_2}"
                 fi
-            done
-            ;;
-    esac
+            elif  [[ "${PIHOLE_DNS_1}" ]] && [[ ! "${PIHOLE_DNS_2}" ]]; then
+                prePopulate="${PIHOLE_DNS_1}"
+            elif [[ "${PIHOLE_DNS_1}" ]] && [[ "${PIHOLE_DNS_2}" ]]; then
+                prePopulate="${PIHOLE_DNS_1}, ${PIHOLE_DNS_2}"
+            fi
+
+            # Dialog for the user to enter custom upstream servers
+            piholeDNS=$(whiptail --backtitle "Specify Upstream DNS Provider(s)"  --inputbox "Enter your desired upstream DNS provider(s), separated by a comma.\\n\\nFor example '8.8.8.8, 8.8.4.4'" ${r} ${c} "${prePopulate}" 3>&1 1>&2 2>&3) || \
+            { printf "  %bCancel was selected, exiting installer%b\\n" "${COL_LIGHT_RED}" "${COL_NC}"; exit 1; }
+            # Clean user input and replace whitespace with comma.
+            piholeDNS=$(sed 's/[, \t]\+/,/g' <<< "${piholeDNS}")
+
+            printf -v PIHOLE_DNS_1 "%s" "${piholeDNS%%,*}"
+            printf -v PIHOLE_DNS_2 "%s" "${piholeDNS##*,}"
+
+            # If the IP is valid,
+            if ! valid_ip "${PIHOLE_DNS_1}" || [[ ! "${PIHOLE_DNS_1}" ]]; then
+                # store it in the variable so we can use it
+                PIHOLE_DNS_1=${strInvalid}
+            fi
+            # Do the same for the secondary server
+            if ! valid_ip "${PIHOLE_DNS_2}" && [[ "${PIHOLE_DNS_2}" ]]; then
+                PIHOLE_DNS_2=${strInvalid}
+            fi
+            # If either of the DNS servers are invalid,
+            if [[ "${PIHOLE_DNS_1}" == "${strInvalid}" ]] || [[ "${PIHOLE_DNS_2}" == "${strInvalid}" ]]; then
+                # explain this to the user
+                whiptail --msgbox --backtitle "Invalid IP" --title "Invalid IP" "One or both entered IP addresses were invalid. Please try again.\\n\\n    DNS Server 1:   $PIHOLE_DNS_1\\n    DNS Server 2:   ${PIHOLE_DNS_2}" ${r} ${c}
+                # and set the variables back to nothing
+                if [[ "${PIHOLE_DNS_1}" == "${strInvalid}" ]]; then
+                    PIHOLE_DNS_1=""
+                fi
+                if [[ "${PIHOLE_DNS_2}" == "${strInvalid}" ]]; then
+                    PIHOLE_DNS_2=""
+                fi
+            # Since the settings will not work, stay in the loop
+            DNSSettingsCorrect=False
+            # Otherwise,
+            else
+                # Show the settings
+                if (whiptail --backtitle "Specify Upstream DNS Provider(s)" --title "Upstream DNS Provider(s)" --yesno "Are these settings correct?\\n    DNS Server 1:   $PIHOLE_DNS_1\\n    DNS Server 2:   ${PIHOLE_DNS_2}" ${r} ${c}); then
+                # and break from the loop since the servers are valid
+                DNSSettingsCorrect=True
+                # Otherwise,
+                else
+                    # If the settings are wrong, the loop continues
+                    DNSSettingsCorrect=False
+                fi
+            fi
+        done
+     else
+        # Save the old Internal Field Separator in a variable
+        OIFS=$IFS
+        # and set the new one to newline
+        IFS=$'\n'
+        for DNSServer in ${DNS_SERVERS}
+        do
+            DNSName="$(cut -d';' -f1 <<< "${DNSServer}")"
+            if [[ "${DNSchoices}" == "${DNSName}" ]]
+            then
+                printf "%s\\n" "${DNSName}"
+                PIHOLE_DNS_1="$(cut -d';' -f2 <<< "${DNSServer}")"
+                PIHOLE_DNS_2="$(cut -d';' -f3 <<< "${DNSServer}")"
+                break
+            fi
+        done
+        # Restore the IFS to what it was
+        IFS=${OIFS}
+    fi
 }
 
 # Allow the user to enable/disable logging
@@ -1064,7 +1100,7 @@ setPrivacyLevel() {
     local LevelCommand
     local LevelOptions
 
-    LevelCommand=(whiptail --separate-output --radiolist "Select a privacy mode for FTL." "${r}" "${c}" 6)
+    LevelCommand=(whiptail --separate-output --radiolist "Select a privacy mode for FTL. https://docs.pi-hole.net/ftldns/privacylevels/" "${r}" "${c}" 6)
 
     # The default selection is level 0
     LevelOptions=(
@@ -1138,12 +1174,11 @@ chooseBlocklists() {
         mv "${adlistFile}" "${adlistFile}.old"
     fi
     # Let user select (or not) blocklists via a checklist
-    cmd=(whiptail --separate-output --checklist "Pi-hole relies on third party lists in order to block ads.\\n\\nYou can use the suggestions below, and/or add your own after installation\\n\\nTo deselect any list, use the arrow keys and spacebar" "${r}" "${c}" 7)
+    cmd=(whiptail --separate-output --checklist "Pi-hole relies on third party lists in order to block ads.\\n\\nYou can use the suggestions below, and/or add your own after installation\\n\\nTo deselect any list, use the arrow keys and spacebar" "${r}" "${c}" 6)
     # In an array, show the options available (all off by default):
     options=(StevenBlack "StevenBlack's Unified Hosts List" on
         MalwareDom "MalwareDomains" on
         Cameleon "Cameleon" on
-        ZeusTracker "ZeusTracker" on
         DisconTrack "Disconnect.me Tracking" on
         DisconAd "Disconnect.me Ads" on
         HostsFile "Hosts-file.net Ads" on)
@@ -1165,7 +1200,6 @@ appendToListsFile() {
         StevenBlack  )  echo "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts" >> "${adlistFile}";;
         MalwareDom   )  echo "https://mirror1.malwaredomains.com/files/justdomains" >> "${adlistFile}";;
         Cameleon     )  echo "http://sysctl.org/cameleon/hosts" >> "${adlistFile}";;
-        ZeusTracker  )  echo "https://zeustracker.abuse.ch/blocklist.php?download=domainblocklist" >> "${adlistFile}";;
         DisconTrack  )  echo "https://s3.amazonaws.com/lists.disconnect.me/simple_tracking.txt" >> "${adlistFile}";;
         DisconAd     )  echo "https://s3.amazonaws.com/lists.disconnect.me/simple_ad.txt" >> "${adlistFile}";;
         HostsFile    )  echo "https://hosts-file.net/ad_servers.txt" >> "${adlistFile}";;
@@ -1183,7 +1217,6 @@ installDefaultBlocklists() {
     appendToListsFile StevenBlack
     appendToListsFile MalwareDom
     appendToListsFile Cameleon
-    appendToListsFile ZeusTracker
     appendToListsFile DisconTrack
     appendToListsFile DisconAd
     appendToListsFile HostsFile
@@ -1307,7 +1340,7 @@ installScripts() {
         install -o "${USER}" -Dm755 -t "${PI_HOLE_INSTALL_DIR}" ./advanced/Scripts/*.sh
         install -o "${USER}" -Dm755 -t "${PI_HOLE_INSTALL_DIR}" ./automated\ install/uninstall.sh
         install -o "${USER}" -Dm755 -t "${PI_HOLE_INSTALL_DIR}" ./advanced/Scripts/COL_TABLE
-        install -o "${USER}" -Dm755 -t /usr/local/bin/ pihole
+        install -o "${USER}" -Dm755 -t "${PI_HOLE_BIN_DIR}" pihole
         install -Dm644 ./advanced/bash-completion/pihole /etc/bash_completion.d/pihole
         printf "%b  %b %s\\n" "${OVER}" "${TICK}" "${str}"
 
@@ -1325,9 +1358,16 @@ installConfigs() {
     printf "\\n  %b Installing configs from %s...\\n" "${INFO}" "${PI_HOLE_LOCAL_REPO}"
     # Make sure Pi-hole's config files are in place
     version_check_dnsmasq
+
+    # Install list of DNS servers
+    # Format: Name;Primary IPv4;Secondary IPv4;Primary IPv6;Secondary IPv6
+    # Some values may be empty (for example: DNS servers without IPv6 support)
+    echo "${DNS_SERVERS}" > "${PI_HOLE_CONFIG_DIR}/dns-servers.conf"
+
     # Install empty file if it does not exist
-    if [[ ! -f "${PI_HOLE_CONFIG_DIR}/pihole-FTL.conf" ]]; then
-        if ! install -o pihole -g pihole -m 664 /dev/null "${PI_HOLE_CONFIG_DIR}/pihole-FTL.conf" &>/dev/null; then
+    if [[ ! -r "${PI_HOLE_CONFIG_DIR}/pihole-FTL.conf" ]]; then
+        install -d -m 0755 ${PI_HOLE_CONFIG_DIR}
+        if ! install -o pihole -m 664 /dev/null "${PI_HOLE_CONFIG_DIR}/pihole-FTL.conf" &>/dev/null; then
             printf "  %bError: Unable to initialize configuration file %s/pihole-FTL.conf\\n" "${COL_LIGHT_RED}" "${PI_HOLE_CONFIG_DIR}"
             return 1
         fi
@@ -1355,7 +1395,7 @@ installConfigs() {
         # Make sure the external.conf file exists, as lighttpd v1.4.50 crashes without it
         touch /etc/lighttpd/external.conf
         # if there is a custom block page in the html/pihole directory, replace 404 handler in lighttpd config
-        if [[ -f "/var/www/html/pihole/custom.php" ]]; then
+        if [[ -f "${PI_HOLE_BLOCKPAGE_DIR}/custom.php" ]]; then
             sed -i 's/^\(server\.error-handler-404\s*=\s*\).*$/\1"pihole\/custom\.php"/' /etc/lighttpd/lighttpd.conf
         fi
         # Make the directories if they do not exist and set the owners
@@ -1420,9 +1460,9 @@ stop_service() {
 }
 
 # Start/Restart service passed in as argument
-start_service() {
+restart_service() {
     # Local, named variables
-    local str="Starting ${1} service"
+    local str="Restarting ${1} service"
     printf "  %b %s..." "${INFO}" "${str}"
     # If systemctl exists,
     if is_command systemctl ; then
@@ -1523,7 +1563,7 @@ update_package_cache() {
     else
         # show an error and exit
         printf "%b  %b %s\\n" "${OVER}" "${CROSS}" "${str}"
-        printf "  %bError: Unable to update package cache. Please try \"%s\"%b" "${COL_LIGHT_RED}" "${COL_LIGHT_RED}" "${COL_NC}"
+        printf "  %bError: Unable to update package cache. Please try \"%s\"%b" "${COL_LIGHT_RED}" "${UPDATE_PKG_CACHE}" "${COL_NC}"
         return 1
     fi
 }
@@ -1568,7 +1608,6 @@ install_dependent_packages() {
 
     # Install packages passed in via argument array
     # No spinner - conflicts with set -e
-    declare -a argArray1=("${!1}")
     declare -a installArray
 
     # Debian based package install - debconf will download the entire package list
@@ -1578,7 +1617,7 @@ install_dependent_packages() {
     # installed by us, and remove only the installed packages, and not the entire list.
     if is_command debconf-apt-progress ; then
         # For each package,
-        for i in "${argArray1[@]}"; do
+        for i in "$@"; do
             printf "  %b Checking for %s..." "${INFO}" "${i}"
             if dpkg-query -W -f='${Status}' "${i}" 2>/dev/null | grep "ok installed" &> /dev/null; then
                 printf "%b  %b Checking for %s\\n" "${OVER}" "${TICK}" "${i}"
@@ -1597,7 +1636,7 @@ install_dependent_packages() {
     fi
 
     # Install Fedora/CentOS packages
-    for i in "${argArray1[@]}"; do
+    for i in "$@"; do
         printf "  %b Checking for %s..." "${INFO}" "${i}"
         if ${PKG_MANAGER} -q list installed "${i}" &> /dev/null; then
             printf "%b  %b Checking for %s" "${OVER}" "${TICK}" "${i}"
@@ -1621,13 +1660,13 @@ installPiholeWeb() {
     local str="Creating directory for blocking page, and copying files"
     printf "  %b %s..." "${INFO}" "${str}"
     # Install the directory
-    install -d /var/www/html/pihole
+    install -d -m 0755 ${PI_HOLE_BLOCKPAGE_DIR}
     # and the blockpage
-    install -D ${PI_HOLE_LOCAL_REPO}/advanced/{index,blockingpage}.* /var/www/html/pihole/
+    install -D ${PI_HOLE_LOCAL_REPO}/advanced/{index,blockingpage}.* ${PI_HOLE_BLOCKPAGE_DIR}/
 
     # Remove superseded file
-    if [[ -e "/var/www/html/pihole/index.js" ]]; then
-        rm "/var/www/html/pihole/index.js"
+    if [[ -e "${PI_HOLE_BLOCKPAGE_DIR}/index.js" ]]; then
+        rm "${PI_HOLE_BLOCKPAGE_DIR}/index.js"
     fi
 
     printf "%b  %b %s\\n" "${OVER}" "${TICK}" "${str}"
@@ -1635,9 +1674,9 @@ installPiholeWeb() {
     local str="Backing up index.lighttpd.html"
     printf "  %b %s..." "${INFO}" "${str}"
     # If the default index file exists,
-    if [[ -f "/var/www/html/index.lighttpd.html" ]]; then
+    if [[ -f "${webroot}/index.lighttpd.html" ]]; then
         # back it up
-        mv /var/www/html/index.lighttpd.html /var/www/html/index.lighttpd.orig
+        mv ${webroot}/index.lighttpd.html ${webroot}/index.lighttpd.orig
         printf "%b  %b %s\\n" "${OVER}" "${TICK}" "${str}"
     # Otherwise,
     else
@@ -1652,15 +1691,15 @@ installPiholeWeb() {
     # Make the .d directory if it doesn't exist
     mkdir -p /etc/sudoers.d/
     # and copy in the pihole sudoers file
-    cp ${PI_HOLE_LOCAL_REPO}/advanced/Templates/pihole.sudo /etc/sudoers.d/pihole
+    install -m 0640 ${PI_HOLE_LOCAL_REPO}/advanced/Templates/pihole.sudo /etc/sudoers.d/pihole
     # Add lighttpd user (OS dependent) to sudoers file
-    echo "${LIGHTTPD_USER} ALL=NOPASSWD: /usr/local/bin/pihole" >> /etc/sudoers.d/pihole
+    echo "${LIGHTTPD_USER} ALL=NOPASSWD: ${PI_HOLE_BIN_DIR}/pihole" >> /etc/sudoers.d/pihole
 
     # If the Web server user is lighttpd,
     if [[ "$LIGHTTPD_USER" == "lighttpd" ]]; then
         # Allow executing pihole via sudo with Fedora
-        # Usually /usr/local/bin is not permitted as directory for sudoable programs
-        echo "Defaults secure_path = /sbin:/bin:/usr/sbin:/usr/bin:/usr/local/bin" >> /etc/sudoers.d/pihole
+        # Usually /usr/local/bin ${PI_HOLE_BIN_DIR} is not permitted as directory for sudoable programs
+        echo "Defaults secure_path = /sbin:/bin:/usr/sbin:/usr/bin:${PI_HOLE_BIN_DIR}" >> /etc/sudoers.d/pihole
     fi
     # Set the strict permissions on the file
     chmod 0440 /etc/sudoers.d/pihole
@@ -1847,15 +1886,15 @@ installPihole() {
 
     # If the user wants to install the Web interface,
     if [[ "${INSTALL_WEB_INTERFACE}" == true ]]; then
-        if [[ ! -d "/var/www/html" ]]; then
+        if [[ ! -d "${webroot}" ]]; then
             # make the Web directory if necessary
-            mkdir -p /var/www/html
+            install -d -m 0755 ${webroot}
         fi
 
         if [[ "${INSTALL_WEB_SERVER}" == true ]]; then
             # Set the owner and permissions
-            chown ${LIGHTTPD_USER}:${LIGHTTPD_GROUP} /var/www/html
-            chmod 775 /var/www/html
+            chown ${LIGHTTPD_USER}:${LIGHTTPD_GROUP} ${webroot}
+            chmod 0775 ${webroot}
             # Give pihole access to the Web server group
             usermod -a -G ${LIGHTTPD_GROUP} pihole
             # If the lighttpd command is executable,
@@ -1892,8 +1931,9 @@ installPihole() {
     installCron
     # Install the logrotate file
     installLogrotate
-    # Check if FTL is installed
-    FTLdetect || printf "  %b FTL Engine not installed\\n" "${CROSS}"
+    # Check if dnsmasq is present. If so, disable it and back up any possible
+    # config file
+    disable_dnsmasq
     # Configure the firewall
     if [[ "${useUpdateVars}" == false ]]; then
         configureFirewall
@@ -2116,7 +2156,6 @@ clone_or_update_repos() {
 # Download FTL binary to random temp directory and install FTL binary
 FTLinstall() {
     # Local, named variables
-    local binary="${1}"
     local latesttag
     local str="Downloading and Installing FTL"
     printf "  %b %s..." "${INFO}" "${str}"
@@ -2160,33 +2199,21 @@ FTLinstall() {
         # If we downloaded binary file (as opposed to text),
         if sha1sum --status --quiet -c "${binary}".sha1; then
             printf "transferred... "
-            # Stop FTL
+
+            # Before stopping FTL, we download the macvendor database
+            curl -sSL "https://ftl.pi-hole.net/macvendor.db" -o "${PI_HOLE_CONFIG_DIR}/macvendor.db" || true
+
+            # Stop pihole-FTL service if available
             stop_service pihole-FTL &> /dev/null
+
             # Install the new version with the correct permissions
             install -T -m 0755 "${binary}" /usr/bin/pihole-FTL
+
             # Move back into the original directory the user was in
             popd > /dev/null || { printf "Unable to return to original directory after FTL binary download.\\n"; return 1; }
-            # Install the FTL service
+
+            # Installed the FTL service
             printf "%b  %b %s\\n" "${OVER}" "${TICK}" "${str}"
-            # dnsmasq can now be stopped and disabled if it exists
-            if which dnsmasq &> /dev/null; then
-                if check_service_active "dnsmasq";then
-                    printf "  %b FTL can now resolve DNS Queries without dnsmasq running separately\\n" "${INFO}"
-                    stop_service dnsmasq
-                    disable_service dnsmasq
-                fi
-            fi
-
-            # Backup existing /etc/dnsmasq.conf if present and ensure that
-            # /etc/dnsmasq.conf contains only "conf-dir=/etc/dnsmasq.d"
-            local conffile="/etc/dnsmasq.conf"
-            if [[ -f "${conffile}" ]]; then
-                printf "  %b Backing up %s to %s.old\\n" "${INFO}" "${conffile}" "${conffile}"
-                mv "${conffile}" "${conffile}.old"
-            fi
-            # Create /etc/dnsmasq.conf
-            echo "conf-dir=/etc/dnsmasq.d" > "${conffile}"
-
             return 0
         # Otherwise,
         else
@@ -2204,6 +2231,27 @@ FTLinstall() {
         printf "  %bError: URL %s/%s not found%b\\n" "${COL_LIGHT_RED}" "${url}" "${binary}" "${COL_NC}"
         return 1
     fi
+}
+
+disable_dnsmasq() {
+    # dnsmasq can now be stopped and disabled if it exists
+    if which dnsmasq &> /dev/null; then
+        if check_service_active "dnsmasq";then
+            printf "  %b FTL can now resolve DNS Queries without dnsmasq running separately\\n" "${INFO}"
+            stop_service dnsmasq
+            disable_service dnsmasq
+        fi
+    fi
+
+    # Backup existing /etc/dnsmasq.conf if present and ensure that
+    # /etc/dnsmasq.conf contains only "conf-dir=/etc/dnsmasq.d"
+    local conffile="/etc/dnsmasq.conf"
+    if [[ -f "${conffile}" ]]; then
+        printf "  %b Backing up %s to %s.old\\n" "${INFO}" "${conffile}" "${conffile}"
+        mv "${conffile}" "${conffile}.old"
+    fi
+    # Create /etc/dnsmasq.conf
+    echo "conf-dir=/etc/dnsmasq.d" > "${conffile}"
 }
 
 get_binary_name() {
@@ -2248,10 +2296,12 @@ get_binary_name() {
     elif [[ "${machine}" == "x86_64" ]]; then
         # This gives the architecture of packages dpkg installs (for example, "i386")
         local dpkgarch
-        dpkgarch=$(dpkg --print-architecture 2> /dev/null)
+        dpkgarch=$(dpkg --print-architecture 2> /dev/null || true)
 
         # Special case: This is a 32 bit OS, installed on a 64 bit machine
         # -> change machine architecture to download the 32 bit executable
+        # We only check this for Debian-based systems as this has been an issue
+        # in the past (see https://github.com/pi-hole/pi-hole/pull/2004)
         if [[ "${dpkgarch}" == "i386" ]]; then
             printf "%b  %b Detected 32bit (i686) architecture\\n" "${OVER}" "${TICK}"
             binary="pihole-FTL-linux-x86_32"
@@ -2333,8 +2383,16 @@ FTLcheckUpdate() {
         if [[ ${ftlLoc} ]]; then
             local FTLversion
             FTLversion=$(/usr/bin/pihole-FTL tag)
+            local FTLreleaseData
             local FTLlatesttag
-            FTLlatesttag=$(curl -sI https://github.com/pi-hole/FTL/releases/latest | grep 'Location' | awk -F '/' '{print $NF}' | tr -d '\r\n')
+
+            if ! FTLreleaseData=$(curl -sI https://github.com/pi-hole/FTL/releases/latest); then
+                # There was an issue while retrieving the latest version
+                printf "  %b Failed to retrieve latest FTL release metadata" "${CROSS}"
+                return 3
+            fi
+
+            FTLlatesttag=$(grep 'Location' <<< "${FTLreleaseData}" | awk -F '/' '{print $NF}' | tr -d '\r\n')
 
             if [[ "${FTLversion}" != "${FTLlatesttag}" ]]; then
                 return 0
@@ -2363,7 +2421,7 @@ FTLdetect() {
     printf "\\n  %b FTL Checks...\\n\\n" "${INFO}"
 
     if FTLcheckUpdate ; then
-        FTLinstall "${binary}" || return 1
+        FTLinstall || return 1
     fi
 }
 
@@ -2446,7 +2504,7 @@ main() {
     # Start the installer
     # Verify there is enough disk space for the install
     if [[ "${skipSpaceCheck}" == true ]]; then
-        printf"  %b Skipping free disk space verification\\n" "${INFO}"
+        printf "  %b Skipping free disk space verification\\n" "${INFO}"
     else
         verifyFreeDiskSpace
     fi
@@ -2458,7 +2516,7 @@ main() {
     notify_package_updates_available
 
     # Install packages used by this installation script
-    install_dependent_packages INSTALLER_DEPS[@]
+    install_dependent_packages "${INSTALLER_DEPS[@]}"
 
     # Check if SELinux is Enforcing
     checkSelinux
@@ -2509,7 +2567,7 @@ main() {
         dep_install_list+=("${PIHOLE_WEB_DEPS[@]}")
     fi
 
-    install_dependent_packages dep_install_list[@]
+    install_dependent_packages "${dep_install_list[@]}"
     unset dep_install_list
 
     # On some systems, lighttpd is not enabled on first install. We need to enable it here if the user
@@ -2522,6 +2580,11 @@ main() {
         LIGHTTPD_ENABLED=true
     else
         LIGHTTPD_ENABLED=false
+    fi
+    # Check if FTL is installed - do this early on as FTL is a hard dependency for Pi-hole
+    if ! FTLdetect; then
+        printf "  %b FTL Engine not installed\\n" "${CROSS}"
+        exit 1
     fi
 
     # Install and log everything to a file
@@ -2553,7 +2616,7 @@ main() {
     if [[ "${INSTALL_WEB_SERVER}" == true ]]; then
 
         if [[ "${LIGHTTPD_ENABLED}" == true ]]; then
-            start_service lighttpd
+            restart_service lighttpd
             enable_service lighttpd
         else
             printf "  %b Lighttpd is disabled, skipping service restart\\n" "${INFO}"
@@ -2568,7 +2631,7 @@ main() {
     # Fixes a problem reported on Ubuntu 18.04 where trying to start
     # the service before enabling causes installer to exit
     enable_service pihole-FTL
-    start_service pihole-FTL
+    restart_service pihole-FTL
 
     # Download and compile the aggregated block list
     runGravity
@@ -2612,7 +2675,7 @@ main() {
 
     if [[ "${INSTALL_TYPE}" == "Update" ]]; then
         printf "\\n"
-        /usr/local/bin/pihole version --current
+        "${PI_HOLE_BIN_DIR}"/pihole version --current
     fi
 }
 

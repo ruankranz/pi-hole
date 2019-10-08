@@ -16,6 +16,7 @@ readonly dhcpconfig="/etc/dnsmasq.d/02-pihole-dhcp.conf"
 readonly FTLconf="/etc/pihole/pihole-FTL.conf"
 # 03 -> wildcards
 readonly dhcpstaticconfig="/etc/dnsmasq.d/04-pihole-static-dhcp.conf"
+readonly PI_HOLE_BIN_DIR="/usr/local/bin"
 
 coltable="/opt/pihole/COL_TABLE"
 if [[ -f ${coltable} ]]; then
@@ -36,7 +37,7 @@ Options:
   -e, email           Set an administrative contact address for the Block Page
   -h, --help          Show this help dialog
   -i, interface       Specify dnsmasq's interface listening behavior
-  -l, privacylevel    Set privacy level (0 = lowest, 3 = highest)"
+  -l, privacylevel    Set privacy level (0 = lowest, 4 = highest)"
     exit 0
 }
 
@@ -274,7 +275,7 @@ Reboot() {
 }
 
 RestartDNS() {
-    /usr/local/bin/pihole restartdns
+    "${PI_HOLE_BIN_DIR}"/pihole restartdns
 }
 
 SetQueryLogOptions() {
@@ -327,6 +328,12 @@ dhcp-leasefile=/etc/pihole/dhcp.leases
         echo "domain=${PIHOLE_DOMAIN}" >> "${dhcpconfig}"
     fi
 
+    # Sourced from setupVars
+    # shellcheck disable=SC2154
+    if [[ "${DHCP_rapid_commit}" == "true" ]]; then
+        echo "dhcp-rapid-commit" >> "${dhcpconfig}"
+    fi
+
     if [[ "${DHCP_IPv6}" == "true" ]]; then
         echo "#quiet-dhcp6
 #enable-ra
@@ -351,10 +358,19 @@ EnableDHCP() {
     change_setting "DHCP_LEASETIME" "${args[5]}"
     change_setting "PIHOLE_DOMAIN" "${args[6]}"
     change_setting "DHCP_IPv6" "${args[7]}"
+    change_setting "DHCP_rapid_commit" "${args[8]}"
 
     # Remove possible old setting from file
     delete_dnsmasq_setting "dhcp-"
     delete_dnsmasq_setting "quiet-dhcp"
+
+    # If a DHCP client claims that its name is "wpad", ignore that.
+    # This fixes a security hole. see CERT Vulnerability VU#598349
+    # We also ignore "localhost" as Windows behaves strangely if a
+    # device claims this host name
+    add_dnsmasq_setting "dhcp-name-match=set:hostname-ignore,wpad
+dhcp-name-match=set:hostname-ignore,localhost
+dhcp-ignore-names=tag:hostname-ignore"
 
     ProcessDHCPSettings
 
@@ -523,7 +539,7 @@ Interfaces:
 
 Teleporter() {
     local datetimestamp=$(date "+%Y-%m-%d_%H-%M-%S")
-    php /var/www/html/admin/scripts/pi-hole/php/teleporter.php > "pi-hole-teleporter_${datetimestamp}.zip"
+    php /var/www/html/admin/scripts/pi-hole/php/teleporter.php > "pi-hole-teleporter_${datetimestamp}.tar.gz"
 }
 
 addAudit()

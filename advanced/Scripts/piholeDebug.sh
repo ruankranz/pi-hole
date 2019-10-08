@@ -76,6 +76,7 @@ WEB_SERVER_CONFIG_DIRECTORY="/etc/lighttpd"
 HTML_DIRECTORY="/var/www/html"
 WEB_GIT_DIRECTORY="${HTML_DIRECTORY}/admin"
 #BLOCK_PAGE_DIRECTORY="${HTML_DIRECTORY}/pihole"
+SHM_DIRECTORY="/dev/shm"
 
 # Files required by Pi-hole
 # https://discourse.pi-hole.net/t/what-files-does-pi-hole-use/1684
@@ -108,7 +109,6 @@ FTL_PORT="${RUN_DIRECTORY}/pihole-FTL.port"
 PIHOLE_LOG="${LOG_DIRECTORY}/pihole.log"
 PIHOLE_LOG_GZIPS="${LOG_DIRECTORY}/pihole.log.[0-9].*"
 PIHOLE_DEBUG_LOG="${LOG_DIRECTORY}/pihole_debug.log"
-PIHOLE_DEBUG_LOG_SANITIZED="${LOG_DIRECTORY}/pihole_debug-sanitized.log"
 PIHOLE_FTL_LOG="${LOG_DIRECTORY}/pihole-FTL.log"
 
 PIHOLE_WEB_SERVER_ACCESS_LOG_FILE="${WEB_SERVER_LOG_DIRECTORY}/access.log"
@@ -208,11 +208,6 @@ log_write() {
 copy_to_debug_log() {
     # Copy the contents of file descriptor 3 into the debug log
     cat /proc/$$/fd/3 > "${PIHOLE_DEBUG_LOG}"
-    # Since we use color codes such as '\e[1;33m', they should be removed before being
-    # uploaded to our server, since it can't properly display in color
-    # This is accomplished by use sed to remove characters matching that patter
-    # The entire file is then copied over to a sanitized version of the log
-    sed 's/\[[0-9;]\{1,5\}m//g' > "${PIHOLE_DEBUG_LOG_SANITIZED}" <<< cat "${PIHOLE_DEBUG_LOG}"
 }
 
 initialize_debug() {
@@ -268,6 +263,9 @@ compare_local_version_to_git_version() {
             # The commit they are on
             local remote_commit
             remote_commit=$(git describe --long --dirty --tags --always)
+            # Status of the repo
+            local local_status
+            local_status=$(git status -s)
             # echo this information out to the user in a nice format
             # If the current version matches what pihole -v produces, the user is up-to-date
             if [[ "${remote_version}" == "$(pihole -v | awk '/${search_term}/ {print $6}' | cut -d ')' -f1)" ]]; then
@@ -290,6 +288,16 @@ compare_local_version_to_git_version() {
             fi
             # echo the current commit
             log_write "${INFO} Commit: ${remote_commit}"
+            # if `local_status` is non-null, then the repo is not clean, display details here
+            if [[ ${local_status} ]]; then
+              #Replace new lines in the status with 12 spaces to make the output cleaner
+              log_write "${INFO} Status: ${local_status//$'\n'/'\n            '}"
+              local local_diff
+              local_diff=$(git diff)
+              if [[ ${local_diff} ]]; then
+                log_write "${INFO} Diff: ${local_diff//$'\n'/'\n          '}"
+              fi
+            fi
         # If git status failed,
         else
             # Return an error message
@@ -976,6 +984,9 @@ list_files_in_dir() {
             [[ "${dir_to_parse}/${each_file}" == "${PIHOLE_WEB_SERVER_ACCESS_LOG_FILE}" ]] || \
             [[ "${dir_to_parse}/${each_file}" == "${PIHOLE_LOG_GZIPS}" ]]; then
             :
+        elif [[ "${dir_to_parse}" == "${SHM_DIRECTORY}" ]]; then
+            # SHM file - we do not want to see the content, but we want to see the files and their sizes
+            log_write "$(ls -ld "${dir_to_parse}"/"${each_file}")"
         else
             # Then, parse the file's content into an array so each line can be analyzed if need be
             for i in "${!REQUIRED_FILES[@]}"; do
@@ -1019,6 +1030,7 @@ show_content_of_pihole_files() {
     show_content_of_files_in_dir "${CRON_D_DIRECTORY}"
     show_content_of_files_in_dir "${WEB_SERVER_LOG_DIRECTORY}"
     show_content_of_files_in_dir "${LOG_DIRECTORY}"
+    show_content_of_files_in_dir "${SHM_DIRECTORY}"
 }
 
 head_tail_log() {
@@ -1129,20 +1141,20 @@ analyze_pihole_log() {
     IFS="$OLD_IFS"
 }
 
-tricorder_use_nc_or_ssl() {
-    # Users can submit their debug logs using nc (unencrypted) or openssl (enrypted) if available
-    # Check for openssl first since encryption is a good thing
-    if command -v openssl &> /dev/null; then
+tricorder_use_nc_or_curl() {
+    # Users can submit their debug logs using nc (unencrypted) or curl (encrypted) if available
+    # Check for curl first since encryption is a good thing
+    if command -v curl &> /dev/null; then
         # If the command exists,
-        log_write "    * Using ${COL_GREEN}openssl${COL_NC} for transmission."
-        # encrypt and transmit the log and store the token returned in a variable
-        tricorder_token=$(< ${PIHOLE_DEBUG_LOG_SANITIZED} openssl s_client -quiet -connect tricorder.pi-hole.net:${TRICORDER_SSL_PORT_NUMBER} 2> /dev/null)
+        log_write "    * Using ${COL_GREEN}curl${COL_NC} for transmission."
+        # transmit he log via TLS and store the token returned in a variable
+        tricorder_token=$(curl --silent --upload-file ${PIHOLE_DEBUG_LOG} https://tricorder.pi-hole.net:${TRICORDER_SSL_PORT_NUMBER})
     # Otherwise,
     else
         # use net cat
         log_write "${INFO} Using ${COL_YELLOW}netcat${COL_NC} for transmission."
         # Save the token returned by our server in a variable
-        tricorder_token=$(< ${PIHOLE_DEBUG_LOG_SANITIZED} nc tricorder.pi-hole.net ${TRICORDER_NC_PORT_NUMBER})
+        tricorder_token=$(< ${PIHOLE_DEBUG_LOG} nc tricorder.pi-hole.net ${TRICORDER_NC_PORT_NUMBER})
     fi
 }
 
@@ -1168,7 +1180,7 @@ upload_to_tricorder() {
         # let the user know
         log_write "${INFO} Debug script running in automated mode"
         # and then decide again which tool to use to submit it
-        tricorder_use_nc_or_ssl
+        tricorder_use_nc_or_curl
         # If we're not running in automated mode,
     else
         echo ""
@@ -1177,7 +1189,7 @@ upload_to_tricorder() {
         read -r -p "[?] Would you like to upload the log? [y/N] " response
         case ${response} in
             # If they say yes, run our function for uploading the log
-            [yY][eE][sS]|[yY]) tricorder_use_nc_or_ssl;;
+            [yY][eE][sS]|[yY]) tricorder_use_nc_or_curl;;
             # If they choose no, just exit out of the script
             *) log_write "    * Log will ${COL_GREEN}NOT${COL_NC} be uploaded to tricorder.";exit;
         esac
@@ -1204,7 +1216,7 @@ upload_to_tricorder() {
         log_write "   * Please try again or contact the Pi-hole team for assistance."
     fi
     # Finally, show where the log file is no matter the outcome of the function so users can look at it
-    log_write "   * A local copy of the debug log can be found at: ${COL_CYAN}${PIHOLE_DEBUG_LOG_SANITIZED}${COL_NC}\\n"
+    log_write "   * A local copy of the debug log can be found at: ${COL_CYAN}${PIHOLE_DEBUG_LOG}${COL_NC}\\n"
 }
 
 # Run through all the functions we made
